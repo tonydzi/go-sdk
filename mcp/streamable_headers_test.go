@@ -1575,3 +1575,153 @@ func TestValidateParamHeaders_NestedArguments(t *testing.T) {
 		t.Error("validateParamHeaders() = nil, want error for mismatched nested value")
 	}
 }
+
+// TestValidateMcpHeadersEncodedName verifies that the server decodes a
+// Base64-encoded Mcp-Name header before comparing it to the body value, per
+// the "Value encoding" section of the 2026-07-28 transport spec.
+func TestValidateMcpHeadersEncodedName(t *testing.T) {
+	tests := []struct {
+		name           string
+		methodHeader   string
+		nameHeader     string
+		msg            jsonrpc.Message
+		wantErrContain string
+	}{
+		{
+			name:         "encoded tool name matches body",
+			methodHeader: "tools/call",
+			nameHeader:   "=?base64?ZmFzdA==?=",
+			msg:          &jsonrpc.Request{Method: "tools/call", Params: mustMarshal(&CallToolParams{Name: "fast"})},
+		},
+		{
+			name:         "encoded prompt name matches body",
+			methodHeader: "prompts/get",
+			nameHeader:   "=?base64?Y2Fmw6ktdG9vbA==?=",
+			msg:          &jsonrpc.Request{Method: "prompts/get", Params: mustMarshal(&GetPromptParams{Name: "café-tool"})},
+		},
+		{
+			name:         "encoded non-ASCII resource URI matches body",
+			methodHeader: "resources/read",
+			nameHeader:   "=?base64?ZmlsZTovLy/QtNC+0LrRg9C80LXQvdGC0YsudHh0?=",
+			msg:          &jsonrpc.Request{Method: "resources/read", Params: mustMarshal(&ReadResourceParams{URI: "file:///документы.txt"})},
+		},
+		{
+			name:         "encoded sentinel-shaped tool name matches body",
+			methodHeader: "tools/call",
+			nameHeader:   "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=",
+			msg:          &jsonrpc.Request{Method: "tools/call", Params: mustMarshal(&CallToolParams{Name: "=?base64?literal?="})},
+		},
+		{
+			name:           "encoded tool name decodes to a different name",
+			methodHeader:   "tools/call",
+			nameHeader:     "=?base64?c2xvdw==?=",
+			msg:            &jsonrpc.Request{Method: "tools/call", Params: mustMarshal(&CallToolParams{Name: "fast"})},
+			wantErrContain: "Mcp-Name header value '=?base64?c2xvdw==?=' does not match body value 'fast'",
+		},
+		{
+			// Per SEP-2243 a sentinel-shaped name must itself be encoded, so an
+			// unencoded one is not a conformant request.
+			name:           "unencoded sentinel-shaped name is not treated as a literal",
+			methodHeader:   "tools/call",
+			nameHeader:     "=?base64?ZmFzdA==?=",
+			msg:            &jsonrpc.Request{Method: "tools/call", Params: mustMarshal(&CallToolParams{Name: "=?base64?ZmFzdA==?="})},
+			wantErrContain: "does not match body value '=?base64?ZmFzdA==?='",
+		},
+		{
+			name:           "malformed Base64 wrapper",
+			methodHeader:   "tools/call",
+			nameHeader:     "=?base64?ZmFz!!!dA==?=",
+			msg:            &jsonrpc.Request{Method: "tools/call", Params: mustMarshal(&CallToolParams{Name: "fast"})},
+			wantErrContain: "Mcp-Name header contains invalid Base64 encoding",
+		},
+		{
+			name:         "plain header-safe name still matches",
+			methodHeader: "tools/call",
+			nameHeader:   "fast",
+			msg:          &jsonrpc.Request{Method: "tools/call", Params: mustMarshal(&CallToolParams{Name: "fast"})},
+		},
+		{
+			name:           "plain header-safe name still mismatches",
+			methodHeader:   "tools/call",
+			nameHeader:     "slow",
+			msg:            &jsonrpc.Request{Method: "tools/call", Params: mustMarshal(&CallToolParams{Name: "fast"})},
+			wantErrContain: "Mcp-Name header value 'slow' does not match body value 'fast'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			header := http.Header{}
+			header.Set(protocolVersionHeader, minVersionForStandardHeaders)
+			header.Set(methodHeader, tt.methodHeader)
+			header.Set(nameHeader, tt.nameHeader)
+
+			err := validateMcpHeaders(header, tt.msg, nil)
+			if tt.wantErrContain == "" {
+				if err != nil {
+					t.Errorf("validateMcpHeaders() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateMcpHeaders() = nil, want error containing %q", tt.wantErrContain)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrContain) {
+				t.Errorf("validateMcpHeaders() error = %q, want substring %q", err.Error(), tt.wantErrContain)
+			}
+		})
+	}
+}
+
+// TestSetStandardHeadersEncodedName verifies that the client encodes names
+// that are not header-safe, and that the resulting header round-trips through
+// server-side validation.
+func TestSetStandardHeadersEncodedName(t *testing.T) {
+	tests := []struct {
+		name           string
+		msg            jsonrpc.Message
+		wantNameHeader string
+	}{
+		{
+			name:           "plain ASCII tool name is sent verbatim",
+			msg:            &jsonrpc.Request{Method: "tools/call", Params: mustMarshal(&CallToolParams{Name: "my-tool"})},
+			wantNameHeader: "my-tool",
+		},
+		{
+			name:           "non-ASCII tool name is encoded",
+			msg:            &jsonrpc.Request{Method: "tools/call", Params: mustMarshal(&CallToolParams{Name: "café-tool"})},
+			wantNameHeader: "=?base64?Y2Fmw6ktdG9vbA==?=",
+		},
+		{
+			name:           "tool name with surrounding whitespace is encoded",
+			msg:            &jsonrpc.Request{Method: "tools/call", Params: mustMarshal(&CallToolParams{Name: " spaced-tool "})},
+			wantNameHeader: "=?base64?IHNwYWNlZC10b29sIA==?=",
+		},
+		{
+			name:           "sentinel-shaped tool name is encoded",
+			msg:            &jsonrpc.Request{Method: "tools/call", Params: mustMarshal(&CallToolParams{Name: "=?base64?literal?="})},
+			wantNameHeader: "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=",
+		},
+		{
+			name:           "non-ASCII resource URI is encoded",
+			msg:            &jsonrpc.Request{Method: "resources/read", Params: mustMarshal(&ReadResourceParams{URI: "file:///документы.txt"})},
+			wantNameHeader: "=?base64?ZmlsZTovLy/QtNC+0LrRg9C80LXQvdGC0YsudHh0?=",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			header := http.Header{}
+			header.Set(protocolVersionHeader, minVersionForStandardHeaders)
+
+			setStandardHeaders(context.Background(), header, tt.msg)
+
+			if got := header.Get(nameHeader); got != tt.wantNameHeader {
+				t.Errorf("NameHeader = %q, want %q", got, tt.wantNameHeader)
+			}
+			if err := validateMcpHeaders(header, tt.msg, nil); err != nil {
+				t.Errorf("validateMcpHeaders() = %v, want nil", err)
+			}
+		})
+	}
+}
